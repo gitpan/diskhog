@@ -1,0 +1,418 @@
+#!/usr/bin/perl 
+#This script is intended to get an accurate count of files per user and to 
+#list the directory node with the largest concentration of files
+#Totals are displayed per user for each directory,  directory totals include
+#subdirectory totals
+
+=head1 NAME 
+
+diskhog
+
+=head1 SYNOPSYS  
+
+Print a nice report of the per user space usage.  Additionally, show where the most space is used of a given age catagory.
+Current directory is recursed.
+
+Optional "-h" prints a usage message.  
+Optional "-d num" where num is [30 60 90] changes the default sort order to one of the ages specified.  Ages are in days.
+
+  diskhog -h     Usage help
+  diskhog -d 30  Sort by 30 day modification time
+  diskhog -d 60  Sort by 60 day modification time
+  diskhog -d 90  Sort by 90 day modification time
+  diskhog        Sort by >90 day modification time
+  
+=head1 Description
+
+This program will recurse a directory and gather the usage statistics on a per
+user basis.  The report generated consists of six columns and a total of bytes in 
+use for all users.
+
+    Login   The users login ID.
+    <=30    Total of bytes owned by the user that have not been modified in the last 30 days
+    <=60    Same as above except 60 days
+    <=90    Same as above except 90 days
+    >90     Byte total of files older than 90 days
+    Total   Total of bytes for all ages
+
+By default the report is ordered by the user with the most bytes in the >90 column.  The ordering can be changed with the -d switch. As a convenience,
+the largest directory that contains the oldest amount of files is also given.  This should
+save the user or system administrator from looking up what directory is taking up all the space.
+
+=head1 PREREQUISITES
+
+This program requires Number::Format .
+
+=pod SCRIPT CATAGORIES
+
+UNIX/System_administration
+
+=head1 AUTHOR  
+
+Kirk Patton  01/05/03
+E-Mail kirk_patton@yahoo.com
+
+=head1 BUGS    
+
+The program gathers a lot of statistics and can consume alot of memory on large file systems.
+Additionally, is was written on a *nix system and is not portable.
+There may be other problems, but it seems to work.
+
+=head1 COPYRIGHT
+
+This program is free software.  You may copy or redistribute it under the same terms as Perl
+itself.
+
+=cut
+
+
+
+#Need to make sure hard links are not followed for directories and counted
+#for files
+
+#Set up some usefull date numbers
+$DAY = (60 * 60) * 24;
+$d30 = $DAY * 30;
+$d60 = $DAY * 60;
+$d90 = $DAY * 90;
+$current_Time = time;
+
+#Modules to use
+use File::Find;
+use Cwd;
+use Number::Format qw(:subs);
+use Getopt::Std;
+
+#Process command line arguments
+&process_Arguments;
+
+$top_Directory = cwd; #Save our starting point
+find(\&wanted, './');
+
+@user_Summary = user_Tally();
+
+&print_Summary;
+
+sub wanted {
+#Do what you need to do with each file found
+    my($inode,$uid,$size,$mtime);
+
+#Save the full path without doing an expensive cwd
+    $File::Find::name =~ /^\.(.*)/;
+    $absolute_Path = $top_Directory . $1;  
+
+   unless ( ($inode,$uid,$size,$mtime) = (stat($absolute_Path))[1,4,7,9] ){
+       #If we are here, it is because we could not stat the file
+       print STDERR "WARNING Could not stat $absolute_Path \n";
+       my $file_Info = `ls -l $absolute_Path`;
+       print STDERR "$file_Info \n";
+       return;
+   }
+
+#Make sure hard links are ignored
+    if(is_Hard_Link($inode) ){ next; }#Check the inode number
+        else{
+            &update_Visited($inode);
+
+	    #Maintain a uid to user table
+	    unless(exists $uid_To_Login{$uid}){
+		$uid_To_Login{$uid} = (getpwuid($uid))[0];
+		unless(exists $login_To_Uid{ $uid_To_Login{$uid} }) {
+		    $login_To_Uid{ $uid_To_Login{$uid} } = $uid;
+		}
+	    }
+            #Do other things like totaling bytes per user
+            my $age = file_Age($mtime);
+
+            #Load hash with file sizes
+            directory_Statistics($inode,$uid,$size,$mtime,$age);
+
+      }
+}
+
+sub is_Hard_Link{
+
+#Check file against list of already visited files
+    my $inode = $_[0];
+    $return_Value = exists $inodes{$inode};
+    return $return_Value;
+}
+
+sub update_Visited{
+#Add inode to visited table to help us skip files already seen
+    my $inode = $_[0];
+    $inodes{$inode} = 1;
+    return;
+}
+
+sub directory_Statistics{
+#We want to build up a hash with the directory inodes, parent inode, totals for each 
+#directory and user for 30, 60, 90, >90days, total and grand totals
+    my($inode,$uid,$size,$mtime,$age) = @_;
+
+    #Keep track of the actual directory name to inode and inode to directory name tables
+    if( -d _ ){
+    	$dirs{$inode}{name_Tables}{$inode} = $absolute_Path;
+  	$dirs{$inode}{name_Tables}{$absolute_Path} = $inode;
+
+  	#Save the directories inode as a global var we need it later
+  	$current_Directory_Inode = $inode;
+
+  	#Save the parent inode 
+  	my $parent_Directory_Inode = (stat("${absolute_Path}/.."))[1];
+        $dirs{$inode}{parent_Inode} = $parent_Directory_Inode;
+    }
+
+    #Keep directory totals by age
+    if( $age eq 'd30' ){ 
+	$dirs{grand_Total}{$uid}{d30} += $size;
+	$dirs{$current_Directory_Inode}{totals}{d30} += $size;
+	$dirs{$current_Directory_Inode}{totals}{users}{$uid}{d30} += $size;
+	#Keep track of the largest directory
+	my @big_Directory = keys %{ $dirs{users}{$uid}{largest_Directory}{d30} };
+	if( $dirs{users}{$uid}{largest_Directory}{d30}{$big_Directory[0]} < $dirs{$current_Directory_Inode}{totals}{users}{$uid}{d30} ){
+	    #Our bigest dir is not bigger that current dir remove it
+	    delete $dirs{users}{$uid}{largest_Directory}{d30}{$big_Directory[0]};
+
+	    #Save the inode and total of the larger directory
+	    $dirs{users}{$uid}{largest_Directory}{d30}{$current_Directory_Inode} = $dirs{$current_Directory_Inode}{totals}{users}{$uid}{d30}
+	}
+    }
+    if( $age eq 'd60' ){ 
+	$dirs{grand_Total}{$uid}{d60} += $size;
+	$dirs{$current_Directory_Inode}{totals}{d60} += $size;
+	$dirs{$current_Directory_Inode}{totals}{users}{$uid}{d60} += $size;
+#Keep track of the largest directory
+	my @big_Directory = keys %{ $dirs{users}{$uid}{largest_Directory}{d60} };
+	if( $dirs{users}{$uid}{largest_Directory}{d60}{$big_Directory[0]} < $dirs{$current_Directory_Inode}{totals}{users}{$uid}{d60} ){
+	    #Our bigest dir is not bigger that current dir remove it
+	    delete $dirs{users}{$uid}{largest_Directory}{d60}{$big_Directory[0]};
+
+	    #Save the inode and total of the larger directory
+	    $dirs{users}{$uid}{largest_Directory}{d60}{$current_Directory_Inode} = $dirs{$current_Directory_Inode}{totals}{users}{$uid}{d60}
+	}
+    }    
+    if( $age eq 'd90' ){ 
+	$dirs{grand_Total}{$uid}{d90} += $size;
+	$dirs{$current_Directory_Inode}{totals}{d90} += $size;
+	$dirs{$current_Directory_Inode}{totals}{users}{$uid}{d90} += $size;
+#Keep track of the largest directory
+	my @big_Directory = keys %{ $dirs{users}{$uid}{largest_Directory}{d90} };
+	if( $dirs{users}{$uid}{largest_Directory}{d90}{$big_Directory[0]} < $dirs{$current_Directory_Inode}{totals}{users}{$uid}{d90} ){
+	    #Our bigest dir is not bigger that current dir remove it
+	    delete $dirs{users}{$uid}{largest_Directory}{d90}{$big_Directory[0]};
+
+	    #Save the inode and total of the larger directory
+	    $dirs{users}{$uid}{largest_Directory}{d90}{$current_Directory_Inode} = $dirs{$current_Directory_Inode}{totals}{users}{$uid}{d90}
+	}
+    }
+    if( $age eq 'ancient' ){ 
+	$dirs{grand_Total}{$uid}{ancient} += $size;
+	$dirs{$current_Directory_Inode}{totals}{ancient} += $size;
+	$dirs{$current_Directory_Inode}{totals}{users}{$uid}{ancient} += $size;
+#Keep track of the largest directory
+	my @big_Directory = keys %{ $dirs{users}{$uid}{largest_Directory}{ancient} };
+	if( $dirs{users}{$uid}{largest_Directory}{ancient}{$big_Directory[0]} < $dirs{$current_Directory_Inode}{totals}{users}{$uid}{ancient} ){
+	    #Our bigest dir is not bigger that current dir remove it
+	    delete $dirs{users}{$uid}{largest_Directory}{ancient}{$big_Directory[0]};
+
+	    #Save the inode and total of the larger directory
+	    $dirs{users}{$uid}{largest_Directory}{ancient}{$current_Directory_Inode} = $dirs{$current_Directory_Inode}{totals}{users}{$uid}{ancient}
+	}
+    }
+
+    #Keep track of total of all ages for each directory
+    $dirs{$current_Directory_Inode}{totals}{total} += $size;
+
+    #Keep track of total of all ages per user per directory
+    $dirs{$current_Directory_Inode}{totals}{users}{$uid}{total} += $size;
+
+    #Keep a grand total per user
+    $dirs{grand_Total}{$uid}{total} += $size;
+
+    #Keep running total of "all" everything
+    $dirs{grand_Total}{total} += $size;
+    
+
+
+}
+
+sub file_Age{
+
+#Catagorize and return the age of the file 30, 60, 90 days old etc
+    my $mtime = $_[0]; #pass in the mtime of the file
+    $mtime = $current_Time - $mtime;
+
+    if( $mtime <= $d30) {return "d30";}
+    elsif ($mtime <= $d60)  {return "d60";}
+    elsif ($mtime <= $d90)  {return "d90";}
+    else {return "ancient";}
+}
+
+sub user_Tally{
+#Build an array containing user summary
+#uid 30 60 90 total
+    my @user_Summary;
+    foreach my $uid ( keys %{$dirs{grand_Total}} ){
+	if( my $login = $uid_To_Login{$uid} ){
+	    #Set default value of '0' if no total exists
+	    my($d30,$d60,$d90,$ancient,$total) = (0,0,0,0,0);
+	    if( exists $dirs{grand_Total}{$uid}{d30} )     { $d30 = $dirs{grand_Total}{$uid}{d30}; }
+	    if( exists $dirs{grand_Total}{$uid}{d60} )     { $d60 = $dirs{grand_Total}{$uid}{d60}; }
+ 	    if( exists $dirs{grand_Total}{$uid}{d90} )     { $d90 = $dirs{grand_Total}{$uid}{d90}; }
+	    if( exists $dirs{grand_Total}{$uid}{ancient} ) { $ancient = $dirs{grand_Total}{$uid}{ancient}; }
+	    if( exists $dirs{grand_Total}{$uid}{total} )   { $total = $dirs{grand_Total}{$uid}{total}; }
+	    push @user_Summary, "$login $d30 $d60 $d90 $ancient $total";
+	}
+    }
+    return @user_Summary;
+}
+
+sub print_Summary{
+#Print a sorted summary for each user
+    open(SUMMARY, ">&STDOUT");  #Alias standard out for report
+    open(DIRECTORY_SUMMARY, ">&STDOUT");
+
+
+    unless( $opt_d ){
+#Sort by files older than 90 days if -d not given
+	@sorted_User_Summary = sort by_Oldest @user_Summary;
+    }
+    elsif( $opt_d == 30 ){
+	@sorted_User_Summary = sort by_Under_30 @user_Summary;
+    }
+    elsif( $opt_d == 60 ){
+	@sorted_User_Summary = sort by_Under_60 @user_Summary;
+    }
+    elsif( $opt_d == 90 ){
+	@sorted_User_Summary = sort by_Under_90 @user_Summary;
+    }
+    
+    foreach my $line (@sorted_User_Summary){
+	($user,$d30,$d60,$d90,$ancient,$total) = split(/\s+/,$line);
+
+#Format data in engineering notation
+	$d30         = format_bytes($d30);
+	$d60         = format_bytes($d60);
+	$d90         = format_bytes($d90);
+	$ancient     = format_bytes($ancient);
+	$total       = format_bytes($total);
+	$grand_Total = format_bytes($dirs{grand_Total}{total});
+
+	write SUMMARY;
+#We need to display the biggest directory owned by the user
+	my @dir30      = keys %{ $dirs{users}{ $login_To_Uid{$user} }{largest_Directory}{d30}     };
+	my @dir60      = keys %{ $dirs{users}{ $login_To_Uid{$user} }{largest_Directory}{d60}     };
+	my @dir90      = keys %{ $dirs{users}{ $login_To_Uid{$user} }{largest_Directory}{d90}     };
+	my @dirancient = keys %{ $dirs{users}{ $login_To_Uid{$user} }{largest_Directory}{ancient} };
+
+
+#Format data
+	$dir30       = format_bytes( $dirs{users}{$login_To_Uid{$user}}{largest_Directory}{d30}{$dir30[0]}           );
+	$dir60       = format_bytes( $dirs{users}{$login_To_Uid{$user}}{largest_Directory}{d60}{$dir60[0]}           );
+	$dir90       = format_bytes( $dirs{users}{$login_To_Uid{$user}}{largest_Directory}{d90}{$dir90[0]}           );
+	$dirold      = format_bytes( $dirs{users}{$login_To_Uid{$user}}{largest_Directory}{ancient}{$dirancient[0]}  );
+
+
+
+
+#Total ages
+	$dirtotal    = format_bytes( $dirs{users}{$login_To_Uid{$user}}{largest_Directory}{d30}{$dir30[0]} + $dirs{users}{$login_To_Uid{$user}}{largest_Directory}{d60}{$dir60[0]} + $dirs{users}{$login_To_Uid{$user}}{largest_Directory}{d90}{$dir90[0]} +$dirs{users}{$login_To_Uid{$user}}{largest_Directory}{ancient}{$dirancient[0]}   );
+
+#Translate the directory inode to the proper name
+	unless( $opt_d ){
+	    #Default sort order is by files older than 90 days
+	    $directory = $dirs{$dirancient[0]}{name_Tables}{$dirancient[0]};
+	}
+	elsif( $opt_d == 30 ){
+	    #Fetch largest directory of files younger than 30 days
+	    $directory = $dirs{$dir30[0]}{name_Tables}{$dir30[0]};
+	}
+	elsif( $opt_d == 60 ){
+	    #Fetch largest directory of files younger than 60 days
+	    $directory = $dirs{$dir60[0]}{name_Tables}{$dir60[0]};
+	}
+	elsif( $opt_d == 90 ){
+	    #Fetch largest directory of files younger than 90 days
+	    $directory = $dirs{$dir90[0]}{name_Tables}{$dir90[0]};
+	}
+	write DIRECTORY_SUMMARY;
+    }
+}
+
+sub by_Oldest{
+#Sort by ancient column
+    @a = split(/\s+/,$a);
+    @b = split(/\s+/,$b);
+    $b[4] <=> $a[4];
+}
+
+sub by_Under_30{
+#Sort by 30 column
+    @a = split(/\s+/,$a);
+    @b = split(/\s+/,$b);
+    $b[1] <=> $a[1];
+}
+
+sub by_Under_60{
+#Sort by 60 column
+    @a = split(/\s+/,$a);
+    @b = split(/\s+/,$b);
+    $b[2] <=> $a[2];
+}
+
+sub by_Under_90{
+#Sort by 90 column
+    @a = split(/\s+/,$a);
+    @b = split(/\s+/,$b);
+    $b[3] <=> $a[3];
+}
+
+sub process_Arguments{
+#Process command line arguments
+#Print a usage summary if they are missused
+    getopts('hd:');
+
+    if( $opt_h || ( $opt_d && ( $opt_d != 30 && $opt_d !=60 && $opt_d != 90 ) ) ){
+	print <<EOF;
+Print a "by user" directory summary of bytes in use.
+
+USAGE
+
+$0        Run program with defaults in current directory.
+$0 -h     Print this help.
+$0 -d 30  Sort by file's 30 days or newer.
+$0 -d 60  Sort by file's 60 days or newer.
+$0 -d 90  Sort by file's 90 days or newer.
+
+The default is to sort by file's older than 90 days.
+
+For more information "perldoc $0".
+
+
+EOF
+	
+    exit;
+    }
+}
+
+format SUMMARY =
+@<<<<<<<<  @<<<<<<<<  @<<<<<<<<  @<<<<<<<<  @<<<<<<<<    @<<<<<<<<
+$user,     $d30,   $d60,   $d90,   $ancient, $total
+
+.
+
+    format SUMMARY_TOP =
+Total bytes in use = @<<<<<<<<
+$grand_Total
+Login      <=30       <=60       <=90       >90          Total
+.
+
+    format DIRECTORY_SUMMARY =
+       @*
+       $directory
+           @<<<<<<<<  @<<<<<<<<  @<<<<<<<<  @<<<<<<<<    @<<<<<<<<
+           $dir30,     $dir60,     $dir90,     $dirold,    $dirtotal
+====================================================================
+.
+

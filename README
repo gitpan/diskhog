@@ -1,0 +1,3 @@
+A utility to recurse a directory and report on per user space usage.
+Additionally it reports which directory a user has most bytes in of
+a given age.
