@@ -1,0 +1,8 @@
+diskhog-0.3	Initial release
+
+diskhog-0.3.1	Mispelled CATEGORY and the script did not appear
+	        in the UNIX/System_administration category as desired
+
+TODO
+I think I may allow the user to change the search time from the hard coded
+mtime to any of mtime, atime or ctime...
